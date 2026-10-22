@@ -1136,3 +1136,258 @@ fn test_oracle_max_age_requires_initialization() {
         Err(Ok(crate::OptionsError::NotInitialized))
     );
 }
+
+// ── Property tests: payout conservation ──────────────────────────────────
+
+mod payout_conservation {
+    extern crate std;
+
+    use crate::{OptionType, OptionsContractClient};
+    use proptest::prelude::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token, Address, Env,
+    };
+
+    const OPENING_TIME: u64 = 500;
+    const EXPIRATION_TIME: u64 = 1_000;
+    const STRIKE: i128 = 100_000_000;
+    const CI_PROPTEST_CASES: u32 = 64;
+
+    struct Position {
+        env: Env,
+        client: OptionsContractClient<'static>,
+        option_id: u32,
+        minter: Address,
+        exerciser: Address,
+        collateral_asset: Address,
+        escrowed: i128,
+    }
+
+    impl Position {
+        fn enter_exercise_window(&self) {
+            self.env.ledger().set_timestamp(750);
+        }
+
+        fn close_window(&self) {
+            self.env.ledger().set_timestamp(EXPIRATION_TIME + 1);
+        }
+
+        /// Asserts the settlement invariant for a single fully closed position:
+        /// buyer payout + writer return + fees == escrowed collateral, and no
+        /// leg exceeds the collateral that was escrowed at mint time.
+        fn assert_conserved(&self, expected_buyer: i128) {
+            let token_client = token::Client::new(&self.env, &self.collateral_asset);
+            let buyer_payout = token_client.balance(&self.exerciser);
+            let writer_return = token_client.balance(&self.minter);
+            // This contract has no fee leg, so any collateral left behind would
+            // be an accounting leak rather than a fee.
+            let fees = token_client.balance(&self.client.address);
+
+            assert_eq!(buyer_payout, expected_buyer, "unexpected buyer payout");
+            assert_eq!(
+                writer_return,
+                self.escrowed - expected_buyer,
+                "unexpected writer return"
+            );
+            assert_eq!(fees, 0, "contract retained collateral");
+            assert!(buyer_payout <= self.escrowed);
+            assert!(writer_return <= self.escrowed);
+            assert!(fees <= self.escrowed);
+            assert_eq!(
+                buyer_payout + writer_return + fees,
+                self.escrowed,
+                "payouts must conserve the escrowed collateral"
+            );
+            assert_eq!(
+                self.client
+                    .get_reserved_collateral(&self.minter, &self.collateral_asset),
+                0,
+                "reserve must be fully released"
+            );
+        }
+    }
+
+    fn open_position(collateral: i128, is_put: bool, strike: i128) -> Position {
+        let (env, client, _, _, underlying, quote) = super::setup_env();
+        let option_type = if is_put {
+            OptionType::Put
+        } else {
+            OptionType::Call
+        };
+        let collateral_asset = if is_put {
+            quote.clone()
+        } else {
+            underlying.clone()
+        };
+        let minter = Address::generate(&env);
+        super::mint_tokens(&env, &collateral_asset, &minter, collateral);
+
+        let option_id = client.mint(
+            &minter,
+            &option_type,
+            &underlying,
+            &quote,
+            &strike,
+            &OPENING_TIME,
+            &EXPIRATION_TIME,
+            &collateral,
+        );
+        let exerciser = Address::generate(&env);
+
+        Position {
+            env,
+            client,
+            option_id,
+            minter,
+            exerciser,
+            collateral_asset,
+            escrowed: collateral,
+        }
+    }
+
+    /// Mixes token-boundary amounts with a broad range so generated cases cover
+    /// one-base-unit decimals as well as large balances.
+    fn collateral_strategy() -> impl Strategy<Value = i128> {
+        prop_oneof![
+            Just(1i128),
+            Just(9i128),
+            Just(10i128),
+            Just(1_000_000_000i128),
+            Just(1_000_000_000_000_000i128),
+            1i128..=1_000_000_000_000_000i128,
+        ]
+    }
+
+    fn exercise_splits(
+        client: &OptionsContractClient,
+        position: &Position,
+        collateral: i128,
+        splits: std::vec::Vec<u8>,
+    ) -> i128 {
+        let mut expected_buyer = 0i128;
+        for split in splits {
+            let remaining = collateral - expected_buyer;
+            if remaining == 0 {
+                break;
+            }
+            let amount = ((collateral / 100) * split as i128).max(1).min(remaining);
+            client.exercise_partial(&position.exerciser, &position.option_id, &amount);
+            expected_buyer += amount;
+        }
+        expected_buyer
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CI_PROPTEST_CASES))]
+
+        #[test]
+        fn max_payout_full_exercise_conserves_collateral(
+            collateral in collateral_strategy(),
+            is_put in any::<bool>(),
+        ) {
+            let position = open_position(collateral, is_put, STRIKE);
+            position.enter_exercise_window();
+            position
+                .client
+                .exercise(&position.exerciser, &position.option_id);
+
+            // A full exercise pays the buyer the entire escrow: the maximum
+            // payout permitted by the collateral.
+            position.assert_conserved(collateral);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CI_PROPTEST_CASES))]
+
+        #[test]
+        fn partial_exercises_then_expiry_conserve_collateral(
+            collateral in collateral_strategy(),
+            is_put in any::<bool>(),
+            splits in prop::collection::vec(1u8..=100, 1..8),
+        ) {
+            let position = open_position(collateral, is_put, STRIKE);
+            position.enter_exercise_window();
+            let expected_buyer =
+                exercise_splits(&position.client, &position, collateral, splits);
+
+            if expected_buyer < collateral {
+                position.close_window();
+                position.client.expire(&position.option_id);
+            }
+
+            position.assert_conserved(expected_buyer);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CI_PROPTEST_CASES))]
+
+        #[test]
+        fn partial_exercises_then_cancel_conserve_collateral(
+            collateral in collateral_strategy(),
+            is_put in any::<bool>(),
+            splits in prop::collection::vec(1u8..=100, 1..8),
+        ) {
+            let position = open_position(collateral, is_put, STRIKE);
+            position.enter_exercise_window();
+            let expected_buyer =
+                exercise_splits(&position.client, &position, collateral, splits);
+
+            if expected_buyer < collateral {
+                position
+                    .client
+                    .cancel(&position.minter, &position.option_id);
+            }
+
+            position.assert_conserved(expected_buyer);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CI_PROPTEST_CASES))]
+
+        #[test]
+        fn zero_intrinsic_value_still_conserves_collateral(
+            collateral in collateral_strategy(),
+            spot in 1i128..=STRIKE,
+            strike_offset in 0i128..=STRIKE,
+        ) {
+            let strike = spot + strike_offset;
+            let position = open_position(collateral, false, strike);
+
+            // At expiry, an at- or out-of-the-money call has zero intrinsic
+            // value; settlement must still conserve the posted collateral.
+            let premium =
+                position
+                    .client
+                    .get_premium(&spot, &strike, &0, &1_000_000_000);
+            prop_assert_eq!(premium, 0);
+
+            position.enter_exercise_window();
+            position
+                .client
+                .exercise(&position.exerciser, &position.option_id);
+            position.assert_conserved(collateral);
+        }
+    }
+
+    #[test]
+    fn one_base_unit_boundary_conserves_collateral() {
+        for collateral in [1i128, 9, 10, 999_999_999, 1_000_000_000] {
+            let position = open_position(collateral, false, STRIKE);
+            position.enter_exercise_window();
+            position
+                .client
+                .exercise_partial(&position.exerciser, &position.option_id, &1);
+
+            let expected_buyer = 1;
+            if expected_buyer < collateral {
+                position.close_window();
+                position.client.expire(&position.option_id);
+            }
+            position.assert_conserved(expected_buyer);
+        }
+    }
+}

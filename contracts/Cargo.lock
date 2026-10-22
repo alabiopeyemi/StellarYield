@@ -1032,6 +1032,7 @@ dependencies = [
 name = "options"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "soroban-sdk",
  "soroban-token-sdk",
  "storage_helpers",
